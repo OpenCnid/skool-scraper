@@ -1,0 +1,6 @@
+downloads/
+manifests/
+*.tsv
+__pycache__/
+*.pyc
+.env
