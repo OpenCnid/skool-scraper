@@ -135,7 +135,7 @@ def extract_course_lessons(page, course_name: str) -> list:
     }""", course_name)
 
 
-def fetch_video_token(page, course_name: str, module_id: str, group: str) -> dict | None:
+def fetch_video_token(page, course_name: str, module_id: str, group: str):
     """Fetch a video token via the Next.js data route."""
     result = page.evaluate("""async ({courseName, moduleId, group}) => {
         const data = JSON.parse(document.getElementById('__NEXT_DATA__').textContent);
