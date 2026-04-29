@@ -1,62 +1,136 @@
 #!/usr/bin/env python3
 """
-Skool Video Downloader
-======================
-Downloads all course videos from a Skool classroom using Playwright + ffmpeg.
+Skool Classroom Downloader
+==========================
+Downloads videos (and, optionally, lesson descriptions and attached files)
+from a Skool classroom using Playwright + ffmpeg.
 
-Setup:
+Setup
+-----
     pip install playwright
     playwright install chromium
-    brew install ffmpeg   # or: apt install ffmpeg
+    # ffmpeg: brew install ffmpeg / sudo apt install ffmpeg
 
-Usage:
-    # Download all courses (opens browser for login)
-    python skool_download.py https://www.skool.com/ai-profit-lab-7462/classroom
+Usage
+-----
+    # First run with a dedicated managed profile (login once, cookies persist)
+    python skool_download.py URL --profile-dir ./skool-profile --headed
 
-    # Download a specific course
-    python skool_download.py https://www.skool.com/ai-profit-lab-7462/classroom --course "6-Week"
+    # Use your existing system Chrome profile instead
+    python skool_download.py URL --profile
 
-    # List courses only
-    python skool_download.py https://www.skool.com/ai-profit-lab-7462/classroom --list
+    # Headless on a server (requires cookies in --profile-dir from a prior run)
+    python skool_download.py URL --profile-dir ./skool-profile --server
 
-    # Use existing Chrome profile (no login needed)
-    python skool_download.py https://www.skool.com/ai-profit-lab-7462/classroom --profile
+    # Also write lesson descriptions (.md) and download attached files
+    python skool_download.py URL --profile-dir ./skool-profile --include-extras
 
-    # Dry run
-    python skool_download.py https://www.skool.com/ai-profit-lab-7462/classroom --dry-run
+    # Smoke test: list courses, download one video
+    python skool_download.py URL --profile-dir ./skool-profile --list
+    python skool_download.py URL --profile-dir ./skool-profile --max-videos 1
 
-Architecture:
-    1. Playwright opens Skool classroom (with your logged-in session)
-    2. Extracts course structure from __NEXT_DATA__ (Next.js SSR)
-    3. For each lesson, fetches the Mux video token via Next.js data routes
-    4. ffmpeg downloads the HLS stream (Mux CDN doesn't restrict IPs)
-    5. Videos saved as: downloads/Course Name/Section/001 - Lesson.mp4
+Architecture
+------------
+1. Playwright opens Skool with the user's session.
+2. ``__NEXT_DATA__`` (Next.js SSR) on ``/classroom`` exposes ``allCourses``.
+3. For each course we visit ``/classroom/{slug}`` and walk the module tree.
+4. For each video module we fetch a fresh Mux token via the Next.js data
+   route, then ffmpeg copies the HLS stream to MP4.
+5. With ``--include-extras`` we additionally visit each module's ``?md=``
+   URL (Skool only fully populates ``desc``/``resources`` for the selected
+   module), write the lesson description as Markdown, and download attached
+   files via Skool's file API.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-
-def sanitize(name: str) -> str:
-    """Clean filename."""
-    name = re.sub(r'[<>:"/\\|?*]', '_', name)
-    return name.strip('. ')[:200]
+import skool_shared as ss
 
 
-def download_video(playback_id: str, token: str, output_path: Path) -> str:
-    """Download a Mux HLS video via ffmpeg. Returns 'ok', 'skip', or error string."""
-    if output_path.exists() and output_path.stat().st_size > 10240:
+# --------------------------------------------------------------------------- #
+# Browser launch
+# --------------------------------------------------------------------------- #
+
+def _system_chrome_profile_path() -> Path:
+    """Return the OS-specific path to the user's existing Chrome profile."""
+    import os, pathlib
+    if sys.platform == "darwin":
+        return pathlib.Path.home() / "Library/Application Support/Google/Chrome"
+    if sys.platform == "win32":
+        return pathlib.Path(os.environ["LOCALAPPDATA"]) / "Google/Chrome/User Data"
+    return pathlib.Path.home() / ".config/google-chrome"
+
+
+def launch_browser(playwright, args):
+    """Return a (context, page) tuple based on the chosen browser mode.
+
+    Mutually exclusive modes (validated in main()):
+      * ``--profile``        : reuse the user's system Chrome profile
+      * ``--profile-dir DIR``: managed Playwright profile (created on demand)
+      * default              : ephemeral context (no persistence)
+
+    ``--server`` requires ``--profile-dir`` and forces headless using the
+    bundled chromium (no system Chrome dependency).
+    """
+    common_args = ["--disable-blink-features=AutomationControlled"]
+
+    if args.profile:
+        chrome_path = _system_chrome_profile_path()
+        context = playwright.chromium.launch_persistent_context(
+            str(chrome_path),
+            headless=False,
+            channel="chrome",
+            args=common_args,
+        )
+        return context, (context.pages[0] if context.pages else context.new_page())
+
+    if args.profile_dir:
+        profile_path = Path(args.profile_dir).expanduser().resolve()
+        profile_path.mkdir(parents=True, exist_ok=True)
+        first_run = not any(profile_path.iterdir())
+        if first_run and not (args.headed or not args.server):
+            print(f"   ℹ️  Empty profile dir: {profile_path}")
+        launch_kwargs = {"args": common_args}
+        if args.server:
+            # bundled headless chromium; no system Chrome needed.
+            launch_kwargs["headless"] = True
+        else:
+            # system Chrome lets the user actually see the window on Linux.
+            launch_kwargs["channel"] = "chrome"
+            launch_kwargs["headless"] = False
+        context = playwright.chromium.launch_persistent_context(
+            str(profile_path), **launch_kwargs)
+        return context, (context.pages[0] if context.pages else context.new_page())
+
+    # Ephemeral
+    browser = playwright.chromium.launch(headless=not args.headed)
+    context = browser.new_context()
+    return context, context.new_page()
+
+
+# --------------------------------------------------------------------------- #
+# Video download
+# --------------------------------------------------------------------------- #
+
+def download_video_with_ffmpeg(playback_id: str, token: str,
+                               output_path: Path) -> str:
+    """ffmpeg copies the Mux HLS stream to ``output_path``.
+
+    Returns ``"ok"``, ``"skip"``, or an error string.
+    """
+    if output_path.exists() and output_path.stat().st_size > 10 * 1024:
         return "skip"
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    hls_url = f"https://stream.mux.com/{playback_id}.m3u8?token={token}"
 
+    hls_url = f"https://stream.mux.com/{playback_id}.m3u8?token={token}"
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-headers", "Referer: https://www.skool.com/\r\n",
@@ -66,290 +140,347 @@ def download_video(playback_id: str, token: str, output_path: Path) -> str:
         "-movflags", "+faststart",
         str(output_path),
     ]
-
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-        if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1024:
-            return "ok"
-        else:
-            if output_path.exists():
-                output_path.unlink()
-            return f"ffmpeg error: {result.stderr[-300:]}"
     except subprocess.TimeoutExpired:
-        if output_path.exists():
-            output_path.unlink()
+        output_path.unlink(missing_ok=True)
         return "timeout"
     except FileNotFoundError:
-        print("\n❌ ffmpeg not found!")
-        print("   macOS:  brew install ffmpeg")
-        print("   Linux:  sudo apt install ffmpeg")
-        print("   Windows: winget install ffmpeg")
+        print("\n❌ ffmpeg not found. Install via brew/apt/winget and retry.")
         sys.exit(1)
+    if (result.returncode == 0 and output_path.exists()
+            and output_path.stat().st_size > 1024):
+        return "ok"
+    output_path.unlink(missing_ok=True)
+    return f"ffmpeg_error: {result.stderr[-300:].strip()}"
 
 
-def extract_courses(page) -> list:
-    """Extract all accessible courses from the classroom page."""
-    return page.evaluate("""() => {
-        const data = JSON.parse(document.getElementById('__NEXT_DATA__').textContent);
-        const courses = data.props.pageProps.renderData.allCourses;
-        return courses
-            .filter(c => c.metadata?.hasAccess === 1)
-            .map(c => ({
-                id: c.id,
-                name: c.name,
-                title: c.metadata.title,
-                numModules: c.metadata.numModules
-            }));
-    }""")
+# --------------------------------------------------------------------------- #
+# Per-course processing
+# --------------------------------------------------------------------------- #
+
+def process_course(page, args, group: str, course: dict, output_dir: Path,
+                   stats: dict) -> bool:
+    """Download every lesson of one course. Returns False if the global
+    ``--max-videos`` limit is reached so the outer loop can stop."""
+    print(f"\n{'=' * 50}")
+    print(f"📖 {course['title']}")
+
+    course_url = f"https://www.skool.com/{group}/classroom/{course['slug']}"
+    try:
+        ss.open_classroom_page(page, course_url)
+    except Exception as e:
+        print(f"   ❌ Failed to open course page: {e}")
+        return True
+
+    try:
+        modules = ss.extract_course_modules(page)
+    except Exception as e:
+        print(f"   ❌ Failed to extract modules: {e}")
+        return True
+
+    if not modules:
+        print("   ⏭️  No modules found")
+        return True
+
+    course_dir = output_dir / ss.sanitize(course["title"])
+    course_dir.mkdir(parents=True, exist_ok=True)
+
+    # Number every module by its full-tree position so that videos, files,
+    # and descriptions for the same lesson share a prefix that matches the
+    # Skool UI lesson order.
+    for position, module in enumerate(modules, 1):
+        section = ss.sanitize(module.get("section", ""))
+        out_dir = course_dir / section if section else course_dir
+        basename = ss.format_lesson_basename(position, module["title"])
+
+        if args.include_extras:
+            _process_extras(page, args, group, course["slug"], module,
+                            out_dir, basename, stats)
+
+        if module.get("videoId"):
+            if not _process_video(page, args, group, course["slug"], module,
+                                  out_dir, basename, stats):
+                # max-videos reached
+                return False
+    return True
 
 
-def extract_course_lessons(page, course_name: str) -> list:
-    """Extract all lessons with video IDs from a course page."""
-    return page.evaluate("""(courseName) => {
-        const data = JSON.parse(document.getElementById('__NEXT_DATA__').textContent);
-        const rd = data.props.pageProps.renderData;
-        const courseTree = rd.course;
+def _process_video(page, args, group: str, course_slug: str, module: dict,
+                   out_dir: Path, basename: str, stats: dict) -> bool:
+    """Download a single video. Returns False once ``--max-videos`` is hit."""
+    output_path = out_dir / f"{basename}.mp4"
+    if output_path.exists() and output_path.stat().st_size > 10 * 1024:
+        size_mb = output_path.stat().st_size / 1024 / 1024
+        print(f"   ⏭️  {basename} ({size_mb:.1f} MB)")
+        stats["skip"] += 1
+        return True
 
-        function walkTree(node, path) {
-            const results = [];
-            const info = node.course || {};
-            const meta = info.metadata || {};
-            const unitType = info.unitType || '';
-            const title = meta.title || info.name || '';
+    time.sleep(args.delay)
+    token = ss.fetch_video_token(page, course_slug, module["id"], group)
+    if not token or token.get("error") or not token.get("playbackId"):
+        err = (token or {}).get("error", "no token")
+        print(f"   ❌ {basename}: {err}")
+        stats["fail"] += 1
+        return True
 
-            if (unitType === 'module' && meta.videoId) {
-                results.push({
-                    title, videoId: meta.videoId,
-                    moduleId: info.id, moduleName: info.name,
-                    section: path.length > 0 ? path[path.length - 1] : ''
-                });
-            }
+    duration_min = (token.get("duration") or 0) / 1000 / 60
+    print(f"   ⬇️  {basename} ({duration_min:.1f} min)")
+    if args.dry_run:
+        print(f"      → {output_path}")
+        return True
 
-            const children = node.children || [];
-            const newPath = unitType === 'set' ? [...path, title] : path;
-            for (const child of children) results.push(...walkTree(child, newPath));
-            return results;
-        }
+    result = download_video_with_ffmpeg(
+        token["playbackId"], token["token"], output_path)
+    if result == "ok":
+        size_mb = output_path.stat().st_size / 1024 / 1024
+        print(f"      ✅ {size_mb:.1f} MB")
+        stats["ok"] += 1
+    elif result == "skip":
+        stats["skip"] += 1
+    else:
+        print(f"      ❌ {result}")
+        stats["fail"] += 1
 
-        return walkTree(courseTree, []);
-    }""", course_name)
-
-
-def fetch_video_token(page, course_name: str, module_id: str, group: str):
-    """Fetch a video token via the Next.js data route."""
-    result = page.evaluate("""async ({courseName, moduleId, group}) => {
-        const data = JSON.parse(document.getElementById('__NEXT_DATA__').textContent);
-        const buildId = data.buildId;
-        const url = `/_next/data/${buildId}/${group}/classroom/${courseName}.json?md=${moduleId}&group=${group}`;
-
-        try {
-            const resp = await fetch(url, {credentials: 'include'});
-            const jdata = await resp.json();
-            const video = jdata.pageProps?.renderData?.video;
-            if (video) {
-                return {
-                    playback_id: video.playbackId,
-                    token: video.playbackToken,
-                    expire: video.expire,
-                    duration: video.duration
-                };
-            }
-        } catch(e) {}
-        return null;
-    }""", {"courseName": course_name, "moduleId": module_id, "group": group})
-    return result
+    if args.max_videos and stats["ok"] >= args.max_videos:
+        print(f"\n⏹  Reached --max-videos={args.max_videos}, stopping.")
+        return False
+    return True
 
 
-def main():
+def _process_extras(page, args, group: str, course_slug: str, module: dict,
+                    out_dir: Path, basename: str, stats: dict) -> None:
+    """Write lesson description as Markdown and download attached files.
+
+    Skool only populates ``desc``/``resources`` fully for the *selected*
+    module, so we navigate to ``?md={moduleId}`` first to fetch full
+    metadata.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        ss.navigate_to_module(page, group, course_slug, module["id"])
+        detail = ss.fetch_full_module_detail(page, module["id"])
+    except Exception as e:
+        print(f"   ⚠️  extras navigation failed for {basename}: {e}")
+        return
+    if not detail:
+        return
+
+    # 1) lesson description
+    md_text = ss.prosemirror_to_markdown(detail.get("desc") or "")
+    if md_text:
+        md_path = out_dir / f"{basename}.md"
+        if not md_path.exists():
+            if args.dry_run:
+                print(f"   📝 {basename}.md ({len(md_text)} chars) → {md_path}")
+            else:
+                md_path.write_text(f"# {detail['title']}\n\n{md_text}\n",
+                                   encoding="utf-8")
+                stats["md"] += 1
+                print(f"   📝 {basename}.md ({len(md_text)} chars)")
+
+    # 2) attached files
+    for resource in detail.get("resources") or []:
+        file_id = resource.get("file_id")
+        if not file_id:
+            continue
+        file_name = resource.get("file_name", "file")
+        title = resource.get("title", file_name)
+        suffix = Path(file_name).suffix or ".bin"
+        out_path = out_dir / f"{basename} - {ss.sanitize(title)}{suffix}"
+        if out_path.exists() and out_path.stat().st_size > 1024:
+            stats["file_skip"] += 1
+            continue
+        if args.dry_run:
+            print(f"   📎 {basename} - {title}{suffix} → {out_path}")
+            continue
+
+        time.sleep(args.delay)
+        signed = ss.fetch_signed_file_url(page, file_id)
+        if signed.get("error") or not signed.get("url"):
+            print(f"   ⚠️  signed-url failed for {title}: "
+                  f"{signed.get('error', 'unknown')}")
+            stats["file_fail"] += 1
+            continue
+        result = ss.download_file_via_browser(page, signed["url"], out_path)
+        if result == "ok":
+            size_kb = out_path.stat().st_size / 1024
+            print(f"   📎 {basename} - {title} ({size_kb:.0f} KB)")
+            stats["files"] += 1
+        elif result == "skip":
+            stats["file_skip"] += 1
+        else:
+            print(f"   ⚠️  download failed for {title}: {result}")
+            stats["file_fail"] += 1
+
+
+# --------------------------------------------------------------------------- #
+# Course-level description (_course.md)
+# --------------------------------------------------------------------------- #
+
+def write_course_description(page, course: dict, course_dir: Path,
+                             stats: dict, dry_run: bool = False) -> None:
+    """Write the course overview to ``_course.md`` if non-empty.
+
+    The classroom page exposes a short course description in
+    ``allCourses[].metadata.description``; we capture it once before
+    walking modules.
+    """
+    desc = page.evaluate("""(slug) => {
+        const d = JSON.parse(document.getElementById('__NEXT_DATA__').textContent);
+        const all = d?.props?.pageProps?.renderData?.allCourses || [];
+        const c = all.find(x => x.name === slug);
+        return c?.metadata?.description || '';
+    }""", course["slug"])
+    md = ss.prosemirror_to_markdown(desc)
+    if not md:
+        return
+    out = course_dir / "_course.md"
+    if out.exists():
+        return
+    if dry_run:
+        print(f"   📝 _course.md ({len(md)} chars) → {out}")
+        return
+    course_dir.mkdir(parents=True, exist_ok=True)
+    out.write_text(f"# {course['title']}\n\n{md}\n", encoding="utf-8")
+    stats["md"] += 1
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Download all videos from a Skool classroom",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog="""\
 Examples:
-  python skool_download.py https://www.skool.com/my-group/classroom
-  python skool_download.py https://www.skool.com/my-group/classroom --course "Week 1"
-  python skool_download.py https://www.skool.com/my-group/classroom --list
-  python skool_download.py https://www.skool.com/my-group/classroom --profile
-        """
+  python skool_download.py URL --profile-dir ./skool-profile --headed
+  python skool_download.py URL --profile
+  python skool_download.py URL --profile-dir ./skool-profile --server
+  python skool_download.py URL --include-extras
+  python skool_download.py URL --max-videos 1 --dry-run
+""",
     )
-    parser.add_argument("url", help="Skool classroom URL")
-    parser.add_argument("--output", "-o", default="downloads", help="Output directory (default: downloads)")
-    parser.add_argument("--course", "-c", help="Download only courses matching this text")
-    parser.add_argument("--list", action="store_true", help="List courses and exit")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would download")
-    parser.add_argument("--profile", action="store_true",
-                       help="Use existing Chrome user profile (skips login)")
+    parser.add_argument("url", help="Skool classroom URL "
+                        "(e.g. https://www.skool.com/GROUP/classroom)")
+    parser.add_argument("--output", "-o", default="downloads",
+                        help="Output directory (default: ./downloads)")
+    parser.add_argument("--course", "-c",
+                        help="Download only courses matching this text (case-insensitive)")
+    parser.add_argument("--list", action="store_true",
+                        help="List accessible courses and exit")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show what would download without writing files")
+
+    profile = parser.add_mutually_exclusive_group()
+    profile.add_argument("--profile", action="store_true",
+                         help="Reuse your system Chrome profile (already logged in)")
+    profile.add_argument("--profile-dir",
+                         help="Use a managed Playwright profile at this path "
+                              "(first run requires login; cookies persist)")
+
     parser.add_argument("--headed", action="store_true",
-                       help="Show browser window (default if not --profile)")
+                        help="Show the browser window (auto-on with --profile or --profile-dir)")
+    parser.add_argument("--server", action="store_true",
+                        help="Headless server mode using Playwright's bundled chromium "
+                             "(requires --profile-dir with existing cookies)")
+    parser.add_argument("--include-extras", action="store_true",
+                        help="Also download lesson descriptions (.md) and attached files (.pdf, …)")
+    parser.add_argument("--max-videos", type=int, default=0, metavar="N",
+                        help="Stop after N successful video downloads (default: unlimited)")
     parser.add_argument("--delay", type=float, default=0.3,
-                       help="Delay between API requests in seconds (default: 0.3)")
-
+                        help="Delay between API calls in seconds (default: 0.3)")
     args = parser.parse_args()
-    output_dir = Path(args.output)
 
-    # Extract group slug from URL
-    import re as re_mod
-    match = re_mod.search(r'skool\.com/([^/]+)', args.url)
+    if args.server and not args.profile_dir:
+        parser.error("--server requires --profile-dir to point to a profile with cookies.")
+    return args
+
+
+def main() -> int:
+    args = parse_args()
+
+    match = re.search(r"skool\.com/([^/?#]+)", args.url)
     if not match:
         print("❌ Invalid Skool URL. Expected: https://www.skool.com/GROUP/classroom")
-        sys.exit(1)
+        return 2
     group = match.group(1)
     classroom_url = f"https://www.skool.com/{group}/classroom"
+    output_dir = Path(args.output)
 
-    print("🎓 Skool Video Downloader")
+    print("🎓 Skool Classroom Downloader")
     print("=" * 50)
+    if args.include_extras:
+        print("   extras: lesson markdown + attached files enabled")
 
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        print("❌ Playwright not installed!")
-        print("   pip install playwright")
-        print("   playwright install chromium")
-        sys.exit(1)
+        print("❌ Playwright not installed. Run: pip install playwright "
+              "&& playwright install chromium")
+        return 1
 
     with sync_playwright() as p:
-        # Launch browser
-        if args.profile:
-            # Use existing Chrome profile
-            import pathlib
-            if sys.platform == "darwin":
-                chrome_path = pathlib.Path.home() / "Library/Application Support/Google/Chrome"
-            elif sys.platform == "win32":
-                chrome_path = pathlib.Path(os.environ["LOCALAPPDATA"]) / "Google/Chrome/User Data"
-            else:
-                chrome_path = pathlib.Path.home() / ".config/google-chrome"
+        context, page = launch_browser(p, args)
+        try:
+            print(f"\n🌐 Loading {classroom_url}")
+            ss.open_classroom_page(page, classroom_url)
 
-            context = p.chromium.launch_persistent_context(
-                str(chrome_path),
-                headless=False,
-                channel="chrome",
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            page = context.new_page()
-        else:
-            browser = p.chromium.launch(headless=not args.headed)
-            context = browser.new_context()
-            page = context.new_page()
+            if not ss.is_logged_in(page):
+                if args.server:
+                    print("❌ Not logged in. --server cannot perform an interactive "
+                          "login; run once without --server to populate the profile.")
+                    return 1
+                if not ss.wait_for_login(page, classroom_url):
+                    print("❌ Login timed out.")
+                    return 1
+                # Re-load classroom root so allCourses is populated.
+                ss.open_classroom_page(page, classroom_url)
 
-        # Navigate to classroom
-        print(f"\n🌐 Loading {classroom_url}")
-        page.goto(classroom_url, wait_until="networkidle")
+            courses = ss.extract_accessible_courses(page)
+            print(f"\n📊 Found {len(courses)} accessible course(s)")
 
-        # Check if we need to login
-        if "/login" in page.url or page.query_selector('input[type="email"]'):
-            print("\n🔐 Login required! Please log in to Skool in the browser window...")
-            if not args.headed and not args.profile:
-                print("   TIP: Run with --headed or --profile to see the browser")
-                sys.exit(1)
-            # Wait for user to complete login and reach classroom
-            page.wait_for_url(f"**/classroom**", timeout=300000)
-            print("   ✅ Login successful!")
+            if args.list:
+                for i, c in enumerate(courses, 1):
+                    print(f"  {i:2}. {c['title']} ({c['numModules']} lessons)")
+                return 0
 
-        # Wait for page data
-        page.wait_for_selector("#__NEXT_DATA__", timeout=10000)
+            if args.course:
+                target = args.course.lower()
+                courses = [c for c in courses if target in c["title"].lower()]
+                if not courses:
+                    print(f"❌ No course matches '{args.course}'")
+                    return 1
 
-        # Get courses
-        courses = extract_courses(page)
-        print(f"\n📊 Found {len(courses)} accessible courses")
+            stats = {"ok": 0, "skip": 0, "fail": 0,
+                     "md": 0, "files": 0, "file_skip": 0, "file_fail": 0}
 
-        if args.list:
-            for i, c in enumerate(courses, 1):
-                print(f"  {i:2}. {c['title']} ({c['numModules']} lessons)")
-            return
+            for course in courses:
+                # _course.md is cheap and useful, write it before extras run.
+                if args.include_extras:
+                    write_course_description(
+                        page, course,
+                        output_dir / ss.sanitize(course["title"]),
+                        stats, dry_run=args.dry_run)
+                if not process_course(page, args, group, course,
+                                       output_dir, stats):
+                    break
 
-        # Filter
-        if args.course:
-            target = args.course.lower()
-            courses = [c for c in courses if target in c['title'].lower()]
-            if not courses:
-                print(f"❌ No course matching '{args.course}'")
-                return
-
-        # Process each course
-        total_stats = {"ok": 0, "skip": 0, "fail": 0}
-
-        for ci, course in enumerate(courses, 1):
-            print(f"\n{'='*50}")
-            print(f"📖 [{ci}/{len(courses)}] {course['title']}")
-
-            # Navigate to the first lesson of this course to load its data
-            first_lesson_url = f"https://www.skool.com/{group}/classroom/{course['name']}"
-            page.goto(first_lesson_url, wait_until="networkidle")
-            page.wait_for_selector("#__NEXT_DATA__", timeout=10000)
-
-            # Check if we got redirected to a specific module
-            current_url = page.url
-            if "md=" not in current_url:
-                # Try with the course tree
-                time.sleep(1)
-
-            # Extract lessons
-            try:
-                lessons = extract_course_lessons(page, course['name'])
-            except Exception as e:
-                print(f"   ❌ Failed to extract lessons: {e}")
-                continue
-
-            video_lessons = [l for l in lessons if l.get('videoId')]
-            if not video_lessons:
-                print(f"   ⏭️  No videos found")
-                continue
-
-            print(f"   {len(video_lessons)} videos found")
-            course_dir = output_dir / sanitize(course['title'])
-
-            for li, lesson in enumerate(video_lessons, 1):
-                section = sanitize(lesson.get('section', ''))
-                out_dir = course_dir / section if section else course_dir
-                filename = f"{li:03d} - {sanitize(lesson['title'])}.mp4"
-                output_path = out_dir / filename
-
-                # Check if already downloaded
-                if output_path.exists() and output_path.stat().st_size > 10240:
-                    size_mb = output_path.stat().st_size / 1024 / 1024
-                    print(f"   [{li}/{len(video_lessons)}] ⏭️  {lesson['title']} ({size_mb:.1f} MB)")
-                    total_stats["skip"] += 1
-                    continue
-
-                # Fetch video token
-                time.sleep(args.delay)
-                video = fetch_video_token(page, course['name'], lesson['moduleId'], group)
-
-                if not video or not video.get('playback_id'):
-                    print(f"   [{li}/{len(video_lessons)}] ❌ No token: {lesson['title']}")
-                    total_stats["fail"] += 1
-                    continue
-
-                duration_min = video.get('duration', 0) / 1000 / 60
-                print(f"   [{li}/{len(video_lessons)}] ⬇️  {lesson['title']} ({duration_min:.1f} min)")
-
-                if args.dry_run:
-                    print(f"      → {output_path}")
-                    continue
-
-                result = download_video(video['playback_id'], video['token'], output_path)
-
-                if result == "ok":
-                    size_mb = output_path.stat().st_size / 1024 / 1024
-                    print(f"      ✅ {size_mb:.1f} MB")
-                    total_stats["ok"] += 1
-                elif result == "skip":
-                    total_stats["skip"] += 1
-                else:
-                    print(f"      ❌ {result}")
-                    total_stats["fail"] += 1
-
-        # Summary
-        print(f"\n{'='*50}")
-        print(f"📊 Final Summary:")
-        print(f"   Downloaded: {total_stats['ok']}")
-        print(f"   Skipped:    {total_stats['skip']}")
-        print(f"   Failed:     {total_stats['fail']}")
-        print(f"   Output:     {output_dir.resolve()}")
-
-        if not args.profile:
+            print(f"\n{'=' * 50}")
+            print("📊 Final Summary:")
+            print(f"   Videos:      {stats['ok']} downloaded, "
+                  f"{stats['skip']} skipped, {stats['fail']} failed")
+            if args.include_extras:
+                print(f"   Markdown:    {stats['md']} written")
+                print(f"   Files:       {stats['files']} downloaded, "
+                      f"{stats['file_skip']} skipped, {stats['file_fail']} failed")
+            print(f"   Output:      {output_dir.resolve()}")
+        finally:
             context.close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
