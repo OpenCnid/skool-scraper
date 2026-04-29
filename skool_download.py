@@ -2,7 +2,8 @@
 """
 Skool Classroom Downloader
 ==========================
-Downloads videos from a Skool classroom using Playwright + ffmpeg.
+Downloads videos (and, optionally, lesson descriptions and attached files)
+from a Skool classroom using Playwright + ffmpeg.
 
 Setup
 -----
@@ -21,6 +22,9 @@ Usage
     # Headless on a server (requires cookies in --profile-dir from a prior run)
     python skool_download.py URL --profile-dir ./skool-profile --server
 
+    # Also write lesson descriptions (.md) and download attached files
+    python skool_download.py URL --profile-dir ./skool-profile --include-extras
+
     # Smoke test: list courses, download one video
     python skool_download.py URL --profile-dir ./skool-profile --list
     python skool_download.py URL --profile-dir ./skool-profile --max-videos 1
@@ -32,11 +36,16 @@ Architecture
 3. For each course we visit ``/classroom/{slug}`` and walk the module tree.
 4. For each video module we fetch a fresh Mux token via the Next.js data
    route, then ffmpeg copies the HLS stream to MP4.
+5. With ``--include-extras`` we additionally visit each module's ``?md=``
+   URL (Skool only fully populates ``desc``/``resources`` for the selected
+   module), write the lesson description as Markdown, and download attached
+   files via Skool's file API.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -86,6 +95,9 @@ def launch_browser(playwright, args):
     if args.profile_dir:
         profile_path = Path(args.profile_dir).expanduser().resolve()
         profile_path.mkdir(parents=True, exist_ok=True)
+        first_run = not any(profile_path.iterdir())
+        if first_run and not (args.headed or not args.server):
+            print(f"   ℹ️  Empty profile dir: {profile_path}")
         launch_kwargs = {"args": common_args}
         if args.server:
             # bundled headless chromium; no system Chrome needed.
@@ -174,19 +186,23 @@ def process_course(page, args, group: str, course: dict, output_dir: Path,
     course_dir = output_dir / ss.sanitize(course["title"])
     course_dir.mkdir(parents=True, exist_ok=True)
 
-    # Number every module by its full-tree position so that videos for the
-    # same course follow the Skool UI lesson order, regardless of whether
-    # the course also has non-video modules in between.
+    # Number every module by its full-tree position so that videos, files,
+    # and descriptions for the same lesson share a prefix that matches the
+    # Skool UI lesson order.
     for position, module in enumerate(modules, 1):
-        if not module.get("videoId"):
-            continue
         section = ss.sanitize(module.get("section", ""))
         out_dir = course_dir / section if section else course_dir
         basename = ss.format_lesson_basename(position, module["title"])
 
-        if not _process_video(page, args, group, course["slug"], module,
-                              out_dir, basename, stats):
-            return False
+        if args.include_extras:
+            _process_extras(page, args, group, course["slug"], module,
+                            out_dir, basename, stats)
+
+        if module.get("videoId"):
+            if not _process_video(page, args, group, course["slug"], module,
+                                  out_dir, basename, stats):
+                # max-videos reached
+                return False
     return True
 
 
@@ -214,7 +230,6 @@ def _process_video(page, args, group: str, course_slug: str, module: dict,
         print(f"      → {output_path}")
         return True
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     result = download_video_with_ffmpeg(
         token["playbackId"], token["token"], output_path)
     if result == "ok":
@@ -233,6 +248,104 @@ def _process_video(page, args, group: str, course_slug: str, module: dict,
     return True
 
 
+def _process_extras(page, args, group: str, course_slug: str, module: dict,
+                    out_dir: Path, basename: str, stats: dict) -> None:
+    """Write lesson description as Markdown and download attached files.
+
+    Skool only populates ``desc``/``resources`` fully for the *selected*
+    module, so we navigate to ``?md={moduleId}`` first to fetch full
+    metadata.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        ss.navigate_to_module(page, group, course_slug, module["id"])
+        detail = ss.fetch_full_module_detail(page, module["id"])
+    except Exception as e:
+        print(f"   ⚠️  extras navigation failed for {basename}: {e}")
+        return
+    if not detail:
+        return
+
+    # 1) lesson description
+    md_text = ss.prosemirror_to_markdown(detail.get("desc") or "")
+    if md_text:
+        md_path = out_dir / f"{basename}.md"
+        if not md_path.exists():
+            if args.dry_run:
+                print(f"   📝 {basename}.md ({len(md_text)} chars) → {md_path}")
+            else:
+                md_path.write_text(f"# {detail['title']}\n\n{md_text}\n",
+                                   encoding="utf-8")
+                stats["md"] += 1
+                print(f"   📝 {basename}.md ({len(md_text)} chars)")
+
+    # 2) attached files
+    for resource in detail.get("resources") or []:
+        file_id = resource.get("file_id")
+        if not file_id:
+            continue
+        file_name = resource.get("file_name", "file")
+        title = resource.get("title", file_name)
+        suffix = Path(file_name).suffix or ".bin"
+        out_path = out_dir / f"{basename} - {ss.sanitize(title)}{suffix}"
+        if out_path.exists() and out_path.stat().st_size > 1024:
+            stats["file_skip"] += 1
+            continue
+        if args.dry_run:
+            print(f"   📎 {basename} - {title}{suffix} → {out_path}")
+            continue
+
+        time.sleep(args.delay)
+        signed = ss.fetch_signed_file_url(page, file_id)
+        if signed.get("error") or not signed.get("url"):
+            print(f"   ⚠️  signed-url failed for {title}: "
+                  f"{signed.get('error', 'unknown')}")
+            stats["file_fail"] += 1
+            continue
+        result = ss.download_file_via_browser(page, signed["url"], out_path)
+        if result == "ok":
+            size_kb = out_path.stat().st_size / 1024
+            print(f"   📎 {basename} - {title} ({size_kb:.0f} KB)")
+            stats["files"] += 1
+        elif result == "skip":
+            stats["file_skip"] += 1
+        else:
+            print(f"   ⚠️  download failed for {title}: {result}")
+            stats["file_fail"] += 1
+
+
+# --------------------------------------------------------------------------- #
+# Course-level description (_course.md)
+# --------------------------------------------------------------------------- #
+
+def write_course_description(page, course: dict, course_dir: Path,
+                             stats: dict, dry_run: bool = False) -> None:
+    """Write the course overview to ``_course.md`` if non-empty.
+
+    The classroom page exposes a short course description in
+    ``allCourses[].metadata.description``; we capture it once before
+    walking modules.
+    """
+    desc = page.evaluate("""(slug) => {
+        const d = JSON.parse(document.getElementById('__NEXT_DATA__').textContent);
+        const all = d?.props?.pageProps?.renderData?.allCourses || [];
+        const c = all.find(x => x.name === slug);
+        return c?.metadata?.description || '';
+    }""", course["slug"])
+    md = ss.prosemirror_to_markdown(desc)
+    if not md:
+        return
+    out = course_dir / "_course.md"
+    if out.exists():
+        return
+    if dry_run:
+        print(f"   📝 _course.md ({len(md)} chars) → {out}")
+        return
+    course_dir.mkdir(parents=True, exist_ok=True)
+    out.write_text(f"# {course['title']}\n\n{md}\n", encoding="utf-8")
+    stats["md"] += 1
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -246,6 +359,7 @@ Examples:
   python skool_download.py URL --profile-dir ./skool-profile --headed
   python skool_download.py URL --profile
   python skool_download.py URL --profile-dir ./skool-profile --server
+  python skool_download.py URL --include-extras
   python skool_download.py URL --max-videos 1 --dry-run
 """,
     )
@@ -272,6 +386,8 @@ Examples:
     parser.add_argument("--server", action="store_true",
                         help="Headless server mode using Playwright's bundled chromium "
                              "(requires --profile-dir with existing cookies)")
+    parser.add_argument("--include-extras", action="store_true",
+                        help="Also download lesson descriptions (.md) and attached files (.pdf, …)")
     parser.add_argument("--max-videos", type=int, default=0, metavar="N",
                         help="Stop after N successful video downloads (default: unlimited)")
     parser.add_argument("--delay", type=float, default=0.3,
@@ -296,6 +412,8 @@ def main() -> int:
 
     print("🎓 Skool Classroom Downloader")
     print("=" * 50)
+    if args.include_extras:
+        print("   extras: lesson markdown + attached files enabled")
 
     try:
         from playwright.sync_api import sync_playwright
@@ -336,9 +454,16 @@ def main() -> int:
                     print(f"❌ No course matches '{args.course}'")
                     return 1
 
-            stats = {"ok": 0, "skip": 0, "fail": 0}
+            stats = {"ok": 0, "skip": 0, "fail": 0,
+                     "md": 0, "files": 0, "file_skip": 0, "file_fail": 0}
 
             for course in courses:
+                # _course.md is cheap and useful, write it before extras run.
+                if args.include_extras:
+                    write_course_description(
+                        page, course,
+                        output_dir / ss.sanitize(course["title"]),
+                        stats, dry_run=args.dry_run)
                 if not process_course(page, args, group, course,
                                        output_dir, stats):
                     break
@@ -347,6 +472,10 @@ def main() -> int:
             print("📊 Final Summary:")
             print(f"   Videos:      {stats['ok']} downloaded, "
                   f"{stats['skip']} skipped, {stats['fail']} failed")
+            if args.include_extras:
+                print(f"   Markdown:    {stats['md']} written")
+                print(f"   Files:       {stats['files']} downloaded, "
+                      f"{stats['file_skip']} skipped, {stats['file_fail']} failed")
             print(f"   Output:      {output_dir.resolve()}")
         finally:
             context.close()
